@@ -256,7 +256,7 @@ function findAnchor(lines: string[], anchor: string, strict: boolean, from: numb
 }
 
 function reindent(text: string, F: string, P: string): string {
-  if (text === '' || /^[ \t]+$/.test(text)) return text; // REQ-104: empty or only-whitespace lines are written as they are
+  if (blank(text)) return text; // REQ-104: a line that is empty or only whitespace (blank) is written as it is
   if (text.startsWith(P)) return F + text.slice(P.length); // REQ-103: that P replaced by F
   return text; // REQ-104: any other line is written as it is
 }
@@ -458,7 +458,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
         endBody();
       }
     }
-    if (L.startsWith('diff --git ')) {
+    if (L === 'diff --git' || L.startsWith('diff --git ')) {
       const m = /^diff --git a\/(.+?) b\/(.+)$/.exec(L);
       if (m === null) throw new Exit2(`error: parse ${num}`); // REQ-122: a `diff --git` line not of the form above
       const s = newSection();
@@ -669,26 +669,27 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
     }
     if (L.startsWith('*** Add File: ')) {
       const path = L.slice('*** Add File: '.length).trim(); // REQ-185
-      const raw: { text: string; emptyLine: boolean }[] = [];
-      let j = i + 1;
-      while (j < last && !isStart(lines[j]!)) {
+      // REQ-184: blank lines at the end of a section are not part of it — the section
+      // ends at the next section start (or the End Patch line) and its trailing blank
+      // lines are trimmed BEFORE its lines are read, so a line in the middle of the
+      // body that is neither a `+` line nor empty is a parse error at its own line.
+      let nextStart = i + 1;
+      while (nextStart < last && !isStart(lines[nextStart]!)) nextStart++;
+      let secEnd = nextStart;
+      while (secEnd > i + 1 && blank(lines[secEnd - 1]!)) secEnd--;
+      const content: string[] = [];
+      for (let j = i + 1; j < secEnd; j++) {
         const bl = lines[j]!;
-        if (bl.startsWith('+')) {
-          raw.push({ text: bl.slice(1), emptyLine: false });
-          j++;
-        } else if (bl === '') {
-          raw.push({ text: '', emptyLine: true }); // REQ-189: an empty line of the file
-          j++;
-        } else break;
+        if (bl.startsWith('+')) content.push(bl.slice(1));
+        else if (bl === '') content.push(''); // REQ-189: an empty line of the file
+        else throw new Exit2(`error: parse ${j + 1}`); // REQ-187: any other line in an Add File section
       }
-      while (raw.length > 0 && raw[raw.length - 1]!.emptyLine) raw.pop(); // REQ-184: blank lines at the end of a section are not part of it
-      const content = raw.map((r) => r.text);
       edits.push((tree) => {
         if (!safe(path)) throw new Fail('unsafe', path);
         if (tree.get(path) !== null) throw new Fail('exists', path); // REQ-199
         tree.now.set(path, content.length === 0 ? '' : content.join('\n') + '\n'); // REQ-199: the section's lines, ended by a line break
       });
-      i = j;
+      i = nextStart;
       continue;
     }
     if (L.startsWith('*** Delete File: ')) {
@@ -704,15 +705,25 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
     if (L.startsWith('*** Update File: ')) {
       const path = L.slice('*** Update File: '.length).trim();
       const updateLine = i + 1;
+      // REQ-184: blank lines at the end of a section are not part of it — the section
+      // ends at the next section start (or the End Patch line) and its trailing blank
+      // lines are trimmed BEFORE its chunks are read. A blank line anywhere else in
+      // the section is a body line like any other: an empty line, or a line of one
+      // space, is a context line whose text is empty (REQ-196), even as the first
+      // line of the first chunk or right before `*** End of File`.
+      let nextStart = i + 1;
+      while (nextStart < last && !isStart(lines[nextStart]!)) nextStart++;
+      let secEnd = nextStart;
+      while (secEnd > i + 1 && blank(lines[secEnd - 1]!)) secEnd--;
       let j = i + 1;
       let moveTo: string | null = null;
-      if (j < last && lines[j]!.startsWith('*** Move to: ')) {
+      if (j < secEnd && lines[j]!.startsWith('*** Move to: ')) {
         moveTo = lines[j]!.slice('*** Move to: '.length).trim(); // REQ-191: only as its first line
         j++;
       }
       const chunks: ChunkRec[] = [];
       let cur: ChunkRec | null = null;
-      while (j < last && !isStart(lines[j]!)) {
+      while (j < secEnd) {
         const bl = lines[j]!;
         if (bl.startsWith('@@')) {
           const anchorText = bl.slice(2).trim(); // REQ-193
@@ -722,8 +733,6 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
           if (cur === null) throw new Exit2(`error: parse ${j + 1}`); // REQ-197: it ends a chunk; with no chunk open it is any other line (REQ-187)
           cur.eof = true; // REQ-197: it ends a chunk and anchors it to the end of the file
           cur = null;
-        } else if (blank(bl) && cur === null) {
-          // Blank spacing outside a chunk is not part of any chunk (REQ-184/186; blank is empty or only whitespace)
         } else if (bl[0] === ' ' || bl[0] === '-' || bl[0] === '+' || bl === '') {
           if (cur === null) {
             if (chunks.length > 0) throw new Exit2(`error: parse ${j + 1}`); // only the first chunk may start at a body line (REQ-195)
@@ -736,15 +745,9 @@ function v4aEdits(lines: string[], strict: boolean): Edit[] {
         }
         j++;
       }
-      if (chunks.length > 0) {
-        const b = chunks[chunks.length - 1]!.body;
-        // REQ-184: blank lines at the end of a section are not part of it — a trailing context
-        // entry with empty text comes from such a blank line (an empty line or a lone space)
-        while (b.length > 0 && b[b.length - 1]!.tag === ' ' && b[b.length - 1]!.text === '') b.pop();
-      }
       if (chunks.length === 0 && moveTo === null) throw new Exit2(`error: parse ${updateLine}`); // REQ-198
       edits.push(v4aUpdateEdit(path, moveTo, chunks, strict));
-      i = j;
+      i = nextStart;
       continue;
     }
     throw new Exit2(`error: parse ${i + 1}`); // REQ-187: any other line
@@ -830,12 +833,21 @@ function run(args: string[]): { code: number; out: string[] } {
   }
   for (const [n, o] of rByNew) rows.push({ key: n, line: `R ${o} -> ${n}` });
   rows.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key))); // REQ-049: byte order of the paths (UTF-8)
-  for (const p of tree.now.keys()) {
-    const was = tree.original(p);
-    const now = tree.now.get(p)!;
-    if (was === now || check) continue; // REQ-016/017: --check writes nothing
-    if (now === null) rmSync(p, { force: true });
-    else {
+  // REQ-016/017: --check writes nothing. Otherwise the disk commit runs in two
+  // passes — every deletion before every write — so a move of foo to foo/bar
+  // removes the file foo before the directory foo is created for the new path;
+  // a single pass in map order would create that directory first and the write
+  // would fail with EEXIST while foo is still a file.
+  if (!check) {
+    for (const p of tree.now.keys()) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (now === null && was !== now) rmSync(p, { force: true });
+    }
+    for (const p of tree.now.keys()) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (now === null || was === now) continue;
       mkdirSync(dirname(p), { recursive: true }); // REQ-065: directories are created as files need them
       writeFileSync(p, now);
     }
